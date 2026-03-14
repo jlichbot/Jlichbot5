@@ -41,6 +41,11 @@ SMART_SIZING   = os.environ.get("SMART_SIZING", "0") == "1"
 DAILY_BUDGET   = float(os.environ.get("DAILY_BUDGET_USD", "20"))
 ASSET          = os.environ.get("SIMMER_SPRINT_ASSET", "BTC")
 
+# ── Force AUTOMATON_MANAGED so SDK always emits structured JSON reports ──────
+# Without this the SDK detects Railway's environment inconsistently and
+# sometimes exits silently with zero output, making failures invisible.
+os.environ.setdefault("AUTOMATON_MANAGED", "1")
+
 # ── Build CLI command ─────────────────────────────────────────────────────────
 cmd = [sys.executable, "fastloop_trader.py", "--quiet"]
 if LIVE_TRADING:
@@ -102,6 +107,7 @@ momentum_val = 0.0
 price_val    = 0.0
 side_val     = "YES"
 
+feed_source = "binance"
 for l in lines:
     if "Momentum:" in l:
         try:
@@ -117,6 +123,12 @@ for l in lines:
         side_val = "YES"
     elif "Signal: NO" in l or "Action: NO" in l:
         side_val = "NO"
+    if "Using Kraken" in l:
+        feed_source = "kraken"
+    elif "Using CoinGecko" in l:
+        feed_source = "coingecko"
+    elif "Failed to fetch price data" in l:
+        feed_source = "none"
 
 market_name = market_line.replace("🎯 Selected:", "").replace("Sprint:", "").strip()
 
@@ -143,6 +155,7 @@ if automaton_data:
             price=price_val,
             momentum=momentum_val,
             dry_run=not LIVE_TRADING,
+            feed=feed_source,
         )
         print(f"✅ Telegram: trade alert sent", flush=True)
 
@@ -165,11 +178,25 @@ if automaton_data:
         print(f"💤 No signal this cycle", flush=True)
 
 else:
-    # No automaton JSON — parse output for errors
-    if "error" in stdout.lower() or "failed" in stdout.lower():
-        notify_error(stdout[-400:])
+    # No automaton JSON — parse output for diagnostic info
+    low = stdout.lower()
+    if "failed to fetch price data" in low:
+        notify_error("All price feeds failed (Binance + Kraken + CoinGecko). Check network.")
+        print("❌ Telegram: price feed failure alert sent", flush=True)
+    elif "no active fast markets" in low:
+        print("💤 No markets available this cycle (off-hours or wrong window)", flush=True)
+    elif "no tradeable markets" in low or "no live tradeable" in low:
+        print("💤 Markets found but none live/within time window", flush=True)
+    elif "already holding" in low:
+        print("💤 Skipped — already holding a position on this market", flush=True)
+    elif "error" in low or "failed" in low:
+        notify_error(f"Unexpected error:\n{stdout[-400:]}")
+        print("⚠️ Telegram: error alert sent", flush=True)
+    elif stdout.strip() == "":
+        # Completely blank output = SDK exited silently (automaton env detection issue)
+        print("⚠️  Empty output — SDK may have exited silently. Check SIMMER_API_KEY is set correctly.", flush=True)
     else:
-        print(f"💤 Cycle complete — no structured report", flush=True)
+        print(f"💤 Cycle complete — no trade signal", flush=True)
 
 print(f"[{ts}] ✅ FastLoop cycle complete", flush=True)
 sys.exit(0)

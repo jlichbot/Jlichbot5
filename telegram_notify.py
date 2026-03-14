@@ -39,10 +39,11 @@ def send(message: str, parse_mode: str = "HTML") -> bool:
         return False
 
 
-def notify_trade(side: str, market: str, amount: float, price: float, momentum: float, dry_run: bool = True):
+def notify_trade(side: str, market: str, amount: float, price: float, momentum: float, dry_run: bool = True, feed: str = "binance"):
     """Alert: a trade was executed (or would be in dry-run)."""
     mode = "🧪 <b>DRY RUN</b>" if dry_run else "✅ <b>LIVE TRADE</b>"
     arrow = "📈" if side.lower() == "yes" else "📉"
+    feed_label = {"binance": "Binance", "kraken": "Kraken ⚡", "coingecko": "CoinGecko"}.get(feed, feed)
     msg = (
         f"{arrow} {mode}\n\n"
         f"<b>Market:</b> {market[:60]}\n"
@@ -50,6 +51,7 @@ def notify_trade(side: str, market: str, amount: float, price: float, momentum: 
         f"<b>Amount:</b> ${amount:.2f}\n"
         f"<b>Price:</b> ${price:.3f}\n"
         f"<b>BTC Momentum:</b> {momentum:+.3f}%\n"
+        f"<b>Feed:</b> {feed_label}\n"
     )
     return send(msg)
 

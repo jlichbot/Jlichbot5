@@ -485,18 +485,126 @@ def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5):
 
 COINGECKO_ASSETS = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana"}
 
+# Kraken symbol mapping (fallback when Binance is geo-blocked)
+KRAKEN_SYMBOLS = {
+    "BTC": "XBTUSD",
+    "ETH": "ETHUSD",
+    "SOL": "SOLUSD",
+}
+
+
+def get_kraken_momentum(asset="BTC", lookback_minutes=5):
+    """Get price momentum from Kraken public REST API.
+    No auth required, no geo-restrictions. Full OHLC candles.
+    Returns same shape as get_binance_momentum().
+    """
+    symbol = KRAKEN_SYMBOLS.get(asset, "XBTUSD")
+    import time as _time
+    since = int(_time.time()) - (lookback_minutes * 60) - 120
+    url = f"https://api.kraken.com/0/public/OHLC?pair={symbol}&interval=1&since={since}"
+    result = _api_request(url)
+    if not result or not isinstance(result, dict) or result.get("error"):
+        return None
+    res_data = result.get("result", {})
+    pair_key = next((k for k in res_data if k != "last"), None)
+    if not pair_key:
+        return None
+    candles = res_data[pair_key]
+    if not candles or len(candles) < 2:
+        return None
+    try:
+        # Kraken OHLC: [time, open, high, low, close, vwap, volume, count]
+        price_then = float(candles[0][1])
+        price_now  = float(candles[-1][4])
+        momentum_pct = ((price_now - price_then) / price_then) * 100
+        direction = "up" if momentum_pct > 0 else "down"
+        volumes = [float(c[6]) for c in candles]
+        avg_volume = sum(volumes) / len(volumes) if volumes else 1.0
+        latest_volume = volumes[-1] if volumes else 1.0
+        volume_ratio = latest_volume / avg_volume if avg_volume > 0 else 1.0
+        return {
+            "momentum_pct": momentum_pct,
+            "direction": direction,
+            "price_now": price_now,
+            "price_then": price_then,
+            "avg_volume": avg_volume,
+            "latest_volume": latest_volume,
+            "volume_ratio": volume_ratio,
+            "candles": len(candles),
+            "source": "kraken",
+        }
+    except (IndexError, ValueError, KeyError, TypeError):
+        return None
+
+
+def get_coingecko_momentum(asset="BTC", lookback_minutes=5):
+    """CoinGecko last-resort fallback. Free tier, no candles — approximates
+    momentum from two price points in market_chart/range.
+    """
+    cg_id = COINGECKO_ASSETS.get(asset, "bitcoin")
+    import time as _time
+    now_ts  = int(_time.time())
+    from_ts = now_ts - (lookback_minutes * 60) - 120
+    url = (
+        f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart/range"
+        f"?vs_currency=usd&from={from_ts}&to={now_ts}"
+    )
+    result = _api_request(url, timeout=10)
+    if not result or not isinstance(result, dict) or result.get("error"):
+        return None
+    prices = result.get("prices", [])
+    if len(prices) < 2:
+        return None
+    try:
+        price_then = float(prices[0][1])
+        price_now  = float(prices[-1][1])
+        momentum_pct = ((price_now - price_then) / price_then) * 100
+        direction = "up" if momentum_pct > 0 else "down"
+        return {
+            "momentum_pct": momentum_pct,
+            "direction": direction,
+            "price_now": price_now,
+            "price_then": price_then,
+            "avg_volume": 1.0,
+            "latest_volume": 1.0,
+            "volume_ratio": 1.0,
+            "candles": len(prices),
+            "source": "coingecko",
+        }
+    except (IndexError, ValueError, KeyError, TypeError):
+        return None
+
 
 def get_momentum(asset="BTC", source="binance", lookback=5):
-    """Get price momentum from configured source."""
-    if source == "binance":
-        symbol = ASSET_SYMBOLS.get(asset, "BTCUSDT")
-        return get_binance_momentum(symbol, lookback)
-    elif source == "coingecko":
-        print("  ⚠️  CoinGecko free tier doesn't provide candle data — switch to binance")
-        print("  Run: python fastloop_trader.py --set signal_source=binance")
-        return None
-    else:
-        return None
+    """Get price momentum with automatic fallback chain.
+    Order: Binance -> Kraken -> CoinGecko
+    Binance is often geo-blocked on cloud IPs (AWS/Railway).
+    Kraken is the primary reliable fallback: full OHLC, no restrictions.
+    """
+    symbol = ASSET_SYMBOLS.get(asset, "BTCUSDT")
+
+    # 1. Try Binance first (lowest latency, best volume data)
+    if source in ("binance", "auto"):
+        result = get_binance_momentum(symbol, lookback)
+        if result:
+            result["source"] = "binance"
+            return result
+        print("  WARNING: Binance unavailable (geo-block or rate limit) -- trying Kraken...")
+
+    # 2. Kraken fallback (no geo-restrictions, full OHLC candles)
+    result = get_kraken_momentum(asset, lookback)
+    if result:
+        print("  INFO: Using Kraken price feed (Binance unavailable)")
+        return result
+    print("  WARNING: Kraken unavailable -- trying CoinGecko...")
+
+    # 3. CoinGecko last resort (free tier, approximate momentum only)
+    result = get_coingecko_momentum(asset, lookback)
+    if result:
+        print("  INFO: Using CoinGecko price feed (volume confidence disabled)")
+        return result
+
+    return None
 
 
 # =============================================================================
