@@ -291,52 +291,37 @@ def fetch_orderbook_summary(clob_token_ids):
 # =============================================================================
 
 def discover_fast_market_markets(asset="BTC", window="5m"):
-    """Find active fast markets.
-    On Railway/cloud environments Simmer API is often unreachable due to IP
-    restrictions, causing a 30s timeout per cycle. SKIP_SIMMER_API=1 bypasses
-    this and goes straight to Gamma which has no IP restrictions.
-    """
-    skip_simmer = os.environ.get("SKIP_SIMMER_API", "0") == "1"
+    """Find active fast markets via Simmer API (pre-imported, reliable).
+    Falls back to Gamma API if Simmer returns no results."""
+    # Primary: Simmer's /api/sdk/fast-markets (markets already imported, is_live_now computed)
+    try:
+        client = get_client()
+        sdk_markets = client.get_fast_markets(asset=asset, window=window, limit=50)
+        if sdk_markets:
+            markets = []
+            for m in sdk_markets:
+                # Parse resolves_at string to datetime for time calculations
+                end_time = _parse_resolves_at(m.resolves_at) if m.resolves_at else None
+                clob_tokens = [m.polymarket_token_id] if m.polymarket_token_id else []
+                if m.polymarket_no_token_id:
+                    clob_tokens.append(m.polymarket_no_token_id)
+                markets.append({
+                    "question": m.question,
+                    "market_id": m.id,  # Already imported — no import step needed
+                    "end_time": end_time,
+                    "clob_token_ids": clob_tokens,
+                    "is_live_now": m.is_live_now,
+                    "spread_cents": m.spread_cents,
+                    "liquidity_tier": m.liquidity_tier,
+                    "external_price_yes": m.external_price_yes,
+                    "fee_rate_bps": getattr(m, 'fee_rate_bps', 0),  # Filled by dynamic lookup after discovery
+                    "source": "simmer",
+                })
+            return markets
+    except Exception as e:
+        print(f"  ⚠️  Simmer fast-markets API failed ({e}), falling back to Gamma")
 
-    if not skip_simmer:
-        # Try Simmer API with a short timeout to avoid blocking the cycle
-        try:
-            import socket
-            # Quick TCP probe before full SDK call — fails fast if unreachable
-            sock = socket.create_connection(("api.simmer.markets", 443), timeout=5)
-            sock.close()
-
-            client = get_client()
-            sdk_markets = client.get_fast_markets(asset=asset, window=window, limit=50)
-            if sdk_markets:
-                markets = []
-                for m in sdk_markets:
-                    end_time = _parse_resolves_at(m.resolves_at) if m.resolves_at else None
-                    clob_tokens = [m.polymarket_token_id] if m.polymarket_token_id else []
-                    if m.polymarket_no_token_id:
-                        clob_tokens.append(m.polymarket_no_token_id)
-                    markets.append({
-                        "question": m.question,
-                        "market_id": m.id,
-                        "end_time": end_time,
-                        "clob_token_ids": clob_tokens,
-                        "is_live_now": m.is_live_now,
-                        "spread_cents": m.spread_cents,
-                        "liquidity_tier": m.liquidity_tier,
-                        "external_price_yes": m.external_price_yes,
-                        "fee_rate_bps": getattr(m, "fee_rate_bps", 0),
-                        "source": "simmer",
-                    })
-                return markets
-        except OSError:
-            # TCP probe failed — Simmer unreachable from this IP, skip immediately
-            print("  INFO: Simmer API unreachable from this IP — using Gamma directly")
-        except Exception as e:
-            print(f"  WARNING: Simmer fast-markets API failed ({type(e).__name__}), using Gamma")
-    else:
-        print("  INFO: SKIP_SIMMER_API=1 — using Gamma directly")
-
-    # Gamma API — no IP restrictions, always reachable
+    # Fallback: Gamma API (may return stale data)
     return _discover_via_gamma(asset, window)
 
 
@@ -500,11 +485,19 @@ def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5):
 
 COINGECKO_ASSETS = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana"}
 
-KRAKEN_SYMBOLS = {"BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD"}
+# Kraken symbol mapping (fallback when Binance is geo-blocked)
+KRAKEN_SYMBOLS = {
+    "BTC": "XBTUSD",
+    "ETH": "ETHUSD",
+    "SOL": "SOLUSD",
+}
 
 
 def get_kraken_momentum(asset="BTC", lookback_minutes=5):
-    """Kraken public OHLC — no geo-restrictions, full candle data."""
+    """Get price momentum from Kraken public REST API.
+    No auth required, no geo-restrictions. Full OHLC candles.
+    Returns same shape as get_binance_momentum().
+    """
     symbol = KRAKEN_SYMBOLS.get(asset, "XBTUSD")
     import time as _time
     since = int(_time.time()) - (lookback_minutes * 60) - 120
@@ -520,6 +513,7 @@ def get_kraken_momentum(asset="BTC", lookback_minutes=5):
     if not candles or len(candles) < 2:
         return None
     try:
+        # Kraken OHLC: [time, open, high, low, close, vwap, volume, count]
         price_then = float(candles[0][1])
         price_now  = float(candles[-1][4])
         momentum_pct = ((price_now - price_then) / price_then) * 100
@@ -528,22 +522,33 @@ def get_kraken_momentum(asset="BTC", lookback_minutes=5):
         avg_volume = sum(volumes) / len(volumes) if volumes else 1.0
         latest_volume = volumes[-1] if volumes else 1.0
         volume_ratio = latest_volume / avg_volume if avg_volume > 0 else 1.0
-        return {"momentum_pct": momentum_pct, "direction": direction,
-                "price_now": price_now, "price_then": price_then,
-                "avg_volume": avg_volume, "latest_volume": latest_volume,
-                "volume_ratio": volume_ratio, "candles": len(candles), "source": "kraken"}
+        return {
+            "momentum_pct": momentum_pct,
+            "direction": direction,
+            "price_now": price_now,
+            "price_then": price_then,
+            "avg_volume": avg_volume,
+            "latest_volume": latest_volume,
+            "volume_ratio": volume_ratio,
+            "candles": len(candles),
+            "source": "kraken",
+        }
     except (IndexError, ValueError, KeyError, TypeError):
         return None
 
 
 def get_coingecko_momentum(asset="BTC", lookback_minutes=5):
-    """CoinGecko free tier last-resort fallback."""
+    """CoinGecko last-resort fallback. Free tier, no candles — approximates
+    momentum from two price points in market_chart/range.
+    """
     cg_id = COINGECKO_ASSETS.get(asset, "bitcoin")
     import time as _time
-    now_ts = int(_time.time())
+    now_ts  = int(_time.time())
     from_ts = now_ts - (lookback_minutes * 60) - 120
-    url = (f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart/range"
-           f"?vs_currency=usd&from={from_ts}&to={now_ts}")
+    url = (
+        f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart/range"
+        f"?vs_currency=usd&from={from_ts}&to={now_ts}"
+    )
     result = _api_request(url, timeout=10)
     if not result or not isinstance(result, dict) or result.get("error"):
         return None
@@ -554,32 +559,51 @@ def get_coingecko_momentum(asset="BTC", lookback_minutes=5):
         price_then = float(prices[0][1])
         price_now  = float(prices[-1][1])
         momentum_pct = ((price_now - price_then) / price_then) * 100
-        return {"momentum_pct": momentum_pct, "direction": "up" if momentum_pct > 0 else "down",
-                "price_now": price_now, "price_then": price_then,
-                "avg_volume": 1.0, "latest_volume": 1.0, "volume_ratio": 1.0,
-                "candles": len(prices), "source": "coingecko"}
+        direction = "up" if momentum_pct > 0 else "down"
+        return {
+            "momentum_pct": momentum_pct,
+            "direction": direction,
+            "price_now": price_now,
+            "price_then": price_then,
+            "avg_volume": 1.0,
+            "latest_volume": 1.0,
+            "volume_ratio": 1.0,
+            "candles": len(prices),
+            "source": "coingecko",
+        }
     except (IndexError, ValueError, KeyError, TypeError):
         return None
 
 
 def get_momentum(asset="BTC", source="binance", lookback=5):
-    """Price momentum with automatic fallback: Binance -> Kraken -> CoinGecko."""
+    """Get price momentum with automatic fallback chain.
+    Order: Binance -> Kraken -> CoinGecko
+    Binance is often geo-blocked on cloud IPs (AWS/Railway).
+    Kraken is the primary reliable fallback: full OHLC, no restrictions.
+    """
     symbol = ASSET_SYMBOLS.get(asset, "BTCUSDT")
+
+    # 1. Try Binance first (lowest latency, best volume data)
     if source in ("binance", "auto"):
         result = get_binance_momentum(symbol, lookback)
         if result:
             result["source"] = "binance"
             return result
-        print("  WARNING: Binance unavailable -- trying Kraken...")
+        print("  WARNING: Binance unavailable (geo-block or rate limit) -- trying Kraken...")
+
+    # 2. Kraken fallback (no geo-restrictions, full OHLC candles)
     result = get_kraken_momentum(asset, lookback)
     if result:
-        print("  INFO: Using Kraken price feed")
+        print("  INFO: Using Kraken price feed (Binance unavailable)")
         return result
     print("  WARNING: Kraken unavailable -- trying CoinGecko...")
+
+    # 3. CoinGecko last resort (free tier, approximate momentum only)
     result = get_coingecko_momentum(asset, lookback)
     if result:
-        print("  INFO: Using CoinGecko price feed")
+        print("  INFO: Using CoinGecko price feed (volume confidence disabled)")
         return result
+
     return None
 
 
@@ -667,55 +691,23 @@ def execute_trade(market_id, side, amount):
         return {"error": str(e)}
 
 
-
-# =============================================================================
-# Compounding Ladder Position Sizing
-# Base = $0.50/trade. Every time cumulative profit doubles from $1, one more
-# trade slot is unlocked. Slots: $0 profit=1, $1=2, $2=4, $4=8, $8=16 ...
-# =============================================================================
-
-BASE_TRADE_SIZE   = 0.50
-LADDER_BASE_THRESHOLD = 1.00
-
-
-def get_ladder_state(skill_file):
-    """Load ladder state. Returns {total_profit_usd, trades_allowed, last_threshold}."""
-    from pathlib import Path
-    path = Path(skill_file).parent / "ladder_state.json"
-    default = {"total_profit_usd": 0.0, "trades_allowed": 1, "last_threshold": 0.0}
-    if path.exists():
-        try:
-            import json as _j
-            with open(path) as f:
-                data = _j.load(f)
-            data["trades_allowed"] = _calc_trades_allowed(data.get("total_profit_usd", 0.0))
-            return data
-        except Exception:
-            pass
-    return default
-
-
-def save_ladder_state(skill_file, state):
-    from pathlib import Path
-    import json as _j
-    path = Path(skill_file).parent / "ladder_state.json"
-    with open(path, "w") as f:
-        _j.dump(state, f, indent=2)
-
-
-def _calc_trades_allowed(total_profit):
-    """1 trade at $0 profit, doubles each time profit doubles from $1."""
-    if total_profit < LADDER_BASE_THRESHOLD:
-        return 1
-    import math
-    doublings = int(math.log2(total_profit / LADDER_BASE_THRESHOLD)) + 1
-    return 2 ** doublings
-
-
 def calculate_position_size(max_size, smart_sizing=False):
-    """Always $0.50. Ladder controls number of trades, not size."""
-    return BASE_TRADE_SIZE
+    """Calculate position size, optionally based on portfolio."""
+    if not smart_sizing:
+        return max_size
+    portfolio = get_portfolio()
+    if not portfolio or portfolio.get("error"):
+        return max_size
+    balance = portfolio.get("balance_usdc", 0)
+    if balance <= 0:
+        return max_size
+    smart_size = balance * SMART_SIZING_PCT
+    return min(smart_size, max_size)
 
+
+# =============================================================================
+# Main Strategy Logic
+# =============================================================================
 
 def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=False,
                         smart_sizing=False, quiet=False):
@@ -744,20 +736,6 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Volume weighting: {'✓' if VOLUME_CONFIDENCE else '✗'}")
     daily_spend = _load_daily_spend(__file__)
     log(f"  Daily budget:     ${DAILY_BUDGET:.2f} (${daily_spend['spent']:.2f} spent today, {daily_spend['trades']} trades)")
-    ladder = get_ladder_state(__file__)
-    trades_allowed_today = ladder["trades_allowed"]
-    total_profit = ladder["total_profit_usd"]
-    log(f"  Trade size:       ${BASE_TRADE_SIZE:.2f} per trade (compounding ladder)")
-    log(f"  Trades allowed:   {trades_allowed_today} slot(s) today (cumulative profit: ${total_profit:.2f})")
-
-    # Ladder gate: block if all slots for today are used
-    if daily_spend["trades"] >= trades_allowed_today:
-        next_threshold = LADDER_BASE_THRESHOLD * (2 ** max(0, trades_allowed_today - 1))
-        log(f"  Ladder limit: {daily_spend['trades']}/{trades_allowed_today} trades used. Grow cumulative profit to ${next_threshold:.2f} to unlock more.", force=True)
-        if not quiet:
-            print(f"Summary: Ladder limit reached ({daily_spend['trades']}/{trades_allowed_today} today)")
-        return
-
 
     if show_config:
         config_path = get_config_path(__file__)
