@@ -46,6 +46,9 @@ ASSET          = os.environ.get("SIMMER_SPRINT_ASSET", "BTC")
 # sometimes exits silently with zero output, making failures invisible.
 os.environ.setdefault("AUTOMATON_MANAGED", "1")
 
+# ── Force structured JSON output from Simmer SDK ─────────────────────────────
+os.environ.setdefault("AUTOMATON_MANAGED", "1")
+
 # ── Build CLI command ─────────────────────────────────────────────────────────
 cmd = [sys.executable, "fastloop_trader.py", "--quiet"]
 if LIVE_TRADING:
